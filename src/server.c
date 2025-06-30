@@ -132,8 +132,8 @@ int main(int argc, char *argv[])
     /* no extra encryption, data is plain */
     if (peer->raw.len != enclen || memcmp(peer->raw.p, enc, enclen) != 0) {
         unsigned char h1[32], h2[32];
-        mbedtls_sha256(peer->raw.p, peer->raw.len, h1, 0);
-        mbedtls_sha256(enc, enclen, h2, 0);
+        mbedtls_sha256_ret(peer->raw.p, peer->raw.len, h1, 0);
+        mbedtls_sha256_ret(enc, enclen, h2, 0);
         fprintf(stderr, "Certificate mismatch\n");
         fprintf(stderr, "peer len=%zu enclen=%zu\n", peer->raw.len, enclen);
         for(int i=0;i<32;i++) fprintf(stderr, "%02x", h1[i]);
@@ -144,7 +144,25 @@ int main(int argc, char *argv[])
         return 1;
     }
     free(enc);
+
+    unsigned char expected_fp[32], peer_fp[32];
+    mbedtls_sha256_ret(peer->raw.p, peer->raw.len, peer_fp, 0);
+    mbedtls_sha256_ret(cacert.raw.p, cacert.raw.len, expected_fp, 0);
+    if (memcmp(peer_fp, expected_fp, 32) != 0) {
+        fprintf(stderr, "Unexpected client certificate\n");
+        return 1;
+    }
     printf("Client certificate verified successfully\n");
+
+    unsigned char pwbuf[64];
+    ret = mbedtls_ssl_read(&ssl, pwbuf, sizeof(pwbuf)-1);
+    if (ret <= 0) handle_error(ret, "ssl_read password");
+    pwbuf[ret] = '\0';
+    if (strcmp((char *)pwbuf, password) != 0) {
+        fprintf(stderr, "Invalid password\n");
+        return 1;
+    }
+    printf("Password verified\n");
 
     /* Read hello message */
     char buf[64];

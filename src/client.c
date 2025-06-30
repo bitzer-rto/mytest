@@ -36,6 +36,7 @@ int main(int argc, char *argv[])
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_x509_crt clicert;
+    mbedtls_x509_crt servercert;
     mbedtls_pk_context pkey;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
@@ -46,6 +47,7 @@ int main(int argc, char *argv[])
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_x509_crt_init(&clicert);
+    mbedtls_x509_crt_init(&servercert);
     mbedtls_pk_init(&pkey);
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
@@ -57,6 +59,9 @@ int main(int argc, char *argv[])
 
     if ((ret = mbedtls_x509_crt_parse_file(&clicert, "client.crt")) != 0)
         handle_error(ret, "x509_crt_parse_file");
+
+    if ((ret = mbedtls_x509_crt_parse_file(&servercert, "server.crt")) != 0)
+        handle_error(ret, "x509_crt_parse_file server");
 
     if ((ret = mbedtls_pk_parse_keyfile(&pkey, "client.key", NULL)) != 0)
         handle_error(ret, "pk_parse_keyfile");
@@ -90,21 +95,26 @@ int main(int argc, char *argv[])
     }
 
     unsigned char fingerprint[32];
-    mbedtls_sha256(peer->raw.p, peer->raw.len, fingerprint, 0);
+    unsigned char expected_fp[32];
+    mbedtls_sha256_ret(peer->raw.p, peer->raw.len, fingerprint, 0);
+    mbedtls_sha256_ret(servercert.raw.p, servercert.raw.len, expected_fp, 0);
+    if (memcmp(fingerprint, expected_fp, 32) != 0) {
+        fprintf(stderr, "Unexpected server certificate\n");
+        return 1;
+    }
     FILE *fp = fopen("server_fingerprint.sha256", "wb");
     if (fp) {
         fwrite(fingerprint, 1, sizeof(fingerprint), fp);
         fclose(fp);
     }
 
-    (void)password;
     /* Send client certificate */
     size_t cert_len = clicert.raw.len;
     unsigned char *buf = malloc(cert_len);
     if (!buf) return 1;
     memcpy(buf, clicert.raw.p, cert_len);
     unsigned char h1[32];
-    mbedtls_sha256(buf, cert_len, h1, 0);
+    mbedtls_sha256_ret(buf, cert_len, h1, 0);
     printf("cert sha256: ");
     for(int i=0;i<32;i++) printf("%02x", h1[i]);
     printf("\n");
@@ -126,6 +136,10 @@ int main(int argc, char *argv[])
     }
     free(buf);
 
+    if ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)password,
+                                 strlen(password))) <= 0)
+        handle_error(ret, "ssl_write password");
+
     const char *hello = "hello";
     if ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)hello, strlen(hello))) <= 0)
         handle_error(ret, "ssl_write hello");
@@ -140,6 +154,7 @@ int main(int argc, char *argv[])
     mbedtls_ssl_close_notify(&ssl);
     mbedtls_net_free(&server_fd);
     mbedtls_x509_crt_free(&clicert);
+    mbedtls_x509_crt_free(&servercert);
     mbedtls_pk_free(&pkey);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);
