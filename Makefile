@@ -19,4 +19,4 @@ clean:
 .PHONY: all clean test
 
 test: all
-	./tests/run.sh
+	./tests/unit.sh
