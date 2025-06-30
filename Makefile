@@ -1,6 +1,6 @@
 CC=gcc
-CFLAGS=-Wall -O2 $(shell pkg-config --cflags mbedtls)
-LDFLAGS=$(shell pkg-config --libs mbedtls mbedx509 mbedcrypto)
+CFLAGS=-Wall -O2 
+LDFLAGS= -lmbedtls -lmbedcrypto -lmbedx509 
 
 SRC=src
 BIN=.
