@@ -1,0 +1,5 @@
+server
+client
+*.crt
+*.key
+server_fingerprint.sha256
