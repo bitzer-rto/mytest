@@ -5,7 +5,7 @@ LDFLAGS= -lmbedtls -lmbedcrypto -lmbedx509
 SRC=src
 BIN=.
 
-all: server client
+all: server client mkcert
 
 server: $(SRC)/server.c
 	$(CC) $(CFLAGS) $< -o $(BIN)/server $(LDFLAGS)
@@ -13,10 +13,15 @@ server: $(SRC)/server.c
 client: $(SRC)/client.c
 	$(CC) $(CFLAGS) $< -o $(BIN)/client $(LDFLAGS)
 
+mkcert:	
+	./scripts/generate_certs.sh
+
+
 clean:
 	rm -f server client
+	rm *.crt; rm client*; rm server*; rm *cert; rm *key; rm -rf certs	
 
 .PHONY: all clean test
 
 test: all
-	./tests/unit.sh
+	./tests/newunit.sh
