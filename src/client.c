@@ -11,6 +11,30 @@
 #include <mbedtls/pk.h>
 #include <mbedtls/error.h>
 #include <mbedtls/sha256.h>
+#include <mbedtls/gcm.h>
+#include <mbedtls/pkcs5.h>
+#include <mbedtls/md.h>
+#include <sys/stat.h>
+
+typedef struct {
+    unsigned char client_random[32];
+    unsigned char server_random[32];
+} export_state_t;
+
+static int export_cb(void *ctx,
+                     const unsigned char *ms,
+                     const unsigned char *kb,
+                     size_t maclen, size_t keylen, size_t ivlen,
+                     const unsigned char client_random[32],
+                     const unsigned char server_random[32],
+                     mbedtls_tls_prf_types tls_prf_type)
+{
+    export_state_t *st = (export_state_t *)ctx;
+    (void)ms; (void)kb; (void)maclen; (void)keylen; (void)ivlen; (void)tls_prf_type;
+    memcpy(st->client_random, client_random, 32);
+    memcpy(st->server_random, server_random, 32);
+    return 0;
+}
 
 
 static void handle_error(int ret, const char *msg)
@@ -36,7 +60,6 @@ int main(int argc, char *argv[])
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     mbedtls_x509_crt clicert;
-    mbedtls_x509_crt servercert;
     mbedtls_pk_context pkey;
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
@@ -47,7 +70,6 @@ int main(int argc, char *argv[])
     mbedtls_ssl_init(&ssl);
     mbedtls_ssl_config_init(&conf);
     mbedtls_x509_crt_init(&clicert);
-    mbedtls_x509_crt_init(&servercert);
     mbedtls_pk_init(&pkey);
     mbedtls_entropy_init(&entropy);
     mbedtls_ctr_drbg_init(&ctr_drbg);
@@ -60,8 +82,6 @@ int main(int argc, char *argv[])
     if ((ret = mbedtls_x509_crt_parse_file(&clicert, "client.crt")) != 0)
         handle_error(ret, "x509_crt_parse_file");
 
-    if ((ret = mbedtls_x509_crt_parse_file(&servercert, "server.crt")) != 0)
-        handle_error(ret, "x509_crt_parse_file server");
 
     if ((ret = mbedtls_pk_parse_keyfile(&pkey, "client.key", NULL)) != 0)
         handle_error(ret, "pk_parse_keyfile");
@@ -80,6 +100,10 @@ int main(int argc, char *argv[])
     mbedtls_ssl_conf_ciphersuites(&conf, ciphersuites);
     mbedtls_ssl_conf_own_cert(&conf, &clicert, &pkey);
 
+    export_state_t exp_state;
+    memset(&exp_state, 0, sizeof(exp_state));
+    mbedtls_ssl_conf_export_keys_ext_cb(&conf, export_cb, &exp_state);
+
     if ((ret = mbedtls_ssl_setup(&ssl, &conf)) != 0)
         handle_error(ret, "ssl_setup");
 
@@ -95,29 +119,59 @@ int main(int argc, char *argv[])
     }
 
     unsigned char fingerprint[32];
-    unsigned char expected_fp[32];
     mbedtls_sha256_ret(peer->raw.p, peer->raw.len, fingerprint, 0);
-    mbedtls_sha256_ret(servercert.raw.p, servercert.raw.len, expected_fp, 0);
-    if (memcmp(fingerprint, expected_fp, 32) != 0) {
-        fprintf(stderr, "Unexpected server certificate\n");
-        return 1;
-    }
-    FILE *fp = fopen("server_fingerprint.sha256", "wb");
+    unsigned char pinned[32];
+    int have_pinned = 0;
+    FILE *fp = fopen("trusted_server.sha256", "rb");
     if (fp) {
-        fwrite(fingerprint, 1, sizeof(fingerprint), fp);
+        if (fread(pinned, 1, sizeof(pinned), fp) == sizeof(pinned))
+            have_pinned = 1;
         fclose(fp);
     }
+    if (have_pinned && memcmp(pinned, fingerprint, 32) != 0) {
+        fprintf(stderr, "Pinned server certificate mismatch\n");
+        return 1;
+    }
 
-    /* Send client certificate */
+    if (!have_pinned) {
+        fp = fopen("trusted_server.sha256", "wb");
+        if (fp) {
+            fwrite(fingerprint, 1, sizeof(fingerprint), fp);
+            fclose(fp);
+        }
+    }
+
+    unsigned char seed[64];
+    memcpy(seed, exp_state.client_random, 32);
+    memcpy(seed + 32, exp_state.server_random, 32);
+    unsigned char salt[32];
+    mbedtls_sha256_ret(seed, sizeof(seed), salt, 0);
+    unsigned char key[32];
+    mbedtls_md_context_t md_ctx;
+    mbedtls_md_init(&md_ctx);
+    mbedtls_md_setup(&md_ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1);
+    if ((ret = mbedtls_pkcs5_pbkdf2_hmac(&md_ctx, (const unsigned char *)password,
+                                         strlen(password), salt, sizeof(salt),
+                                         1000, sizeof(key), key)) != 0)
+        handle_error(ret, "pbkdf2");
+    mbedtls_md_free(&md_ctx);
+
+    mbedtls_gcm_context gcm;
+    mbedtls_gcm_init(&gcm);
+    mbedtls_gcm_setkey(&gcm, MBEDTLS_CIPHER_ID_AES, key, 256);
+
     size_t cert_len = clicert.raw.len;
-    unsigned char *buf = malloc(cert_len);
-    if (!buf) return 1;
-    memcpy(buf, clicert.raw.p, cert_len);
-    unsigned char h1[32];
-    mbedtls_sha256_ret(buf, cert_len, h1, 0);
-    printf("cert sha256: ");
-    for(int i=0;i<32;i++) printf("%02x", h1[i]);
-    printf("\n");
+    unsigned char *enc = malloc(cert_len);
+    if (!enc) return 1;
+    unsigned char iv[12];
+    unsigned char tag[16];
+    mbedtls_ctr_drbg_random(&ctr_drbg, iv, sizeof(iv));
+    if ((ret = mbedtls_gcm_crypt_and_tag(&gcm, MBEDTLS_GCM_ENCRYPT,
+                                         cert_len, iv, sizeof(iv),
+                                         NULL, 0, clicert.raw.p, enc,
+                                         sizeof(tag), tag)) != 0)
+        handle_error(ret, "gcm_encrypt");
+    mbedtls_gcm_free(&gcm);
 
     unsigned char lenbuf[4];
     lenbuf[0] = (cert_len >> 24) & 0xff;
@@ -127,18 +181,19 @@ int main(int argc, char *argv[])
 
     if ((ret = mbedtls_ssl_write(&ssl, lenbuf, 4)) <= 0)
         handle_error(ret, "ssl_write len");
+    if ((ret = mbedtls_ssl_write(&ssl, iv, sizeof(iv))) <= 0)
+        handle_error(ret, "ssl_write iv");
+    if ((ret = mbedtls_ssl_write(&ssl, tag, sizeof(tag))) <= 0)
+        handle_error(ret, "ssl_write tag");
+
     size_t written = 0;
     while (written < cert_len) {
-        ret = mbedtls_ssl_write(&ssl, buf + written, cert_len - written);
+        ret = mbedtls_ssl_write(&ssl, enc + written, cert_len - written);
         if (ret <= 0)
             handle_error(ret, "ssl_write enc");
         written += ret;
     }
-    free(buf);
-
-    if ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)password,
-                                 strlen(password))) <= 0)
-        handle_error(ret, "ssl_write password");
+    free(enc);
 
     const char *hello = "hello";
     if ((ret = mbedtls_ssl_write(&ssl, (const unsigned char *)hello, strlen(hello))) <= 0)
@@ -154,7 +209,6 @@ int main(int argc, char *argv[])
     mbedtls_ssl_close_notify(&ssl);
     mbedtls_net_free(&server_fd);
     mbedtls_x509_crt_free(&clicert);
-    mbedtls_x509_crt_free(&servercert);
     mbedtls_pk_free(&pkey);
     mbedtls_ssl_free(&ssl);
     mbedtls_ssl_config_free(&conf);

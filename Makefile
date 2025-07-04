@@ -25,3 +25,4 @@ clean:
 
 test: all
 	./tests/newunit.sh
+	./tests/pin_check.sh
